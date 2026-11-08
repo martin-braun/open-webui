@@ -14,6 +14,7 @@ from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, BYPASS_MODEL_ACCESS_CONTR
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.models import Models, ModelVoice
+from open_webui.routers.audio.retirement import InputAudioRetirement
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.auth import get_verified_user_by_token
 from open_webui.utils.headers import get_microsoft_entra_id_access_token, include_user_info_headers
@@ -378,6 +379,7 @@ async def realtime_call(ws: WebSocket):
             raise ValueError('Authentication expired or invalid')
         config = await Config.get_many(
             'audio.realtime.enabled',
+            'audio.realtime.input_audio_retention_count',
             'audio.realtime.provider',
             'audio.realtime.auth_type',
             'audio.realtime.openai.api_base_url',
@@ -440,11 +442,42 @@ async def realtime_call(ws: WebSocket):
         protocol = CallProtocol(
             model_info.meta.voice_avatar.gestures if model_info and model_info.meta.voice_avatar else ()
         )
+        retirement = None
+        retention_count = config.get('audio.realtime.input_audio_retention_count', 0)
+        if type(retention_count) is not int or not 0 <= retention_count <= 4096:
+            raise ValueError('Configure a Realtime input audio retention count from 0 to 4096')
+        if retention_count > 0:
+            call_id = auth.get('call_id')
+            if (
+                not isinstance(call_id, str)
+                or not 0 < len(call_id) <= 128
+                or auth.get('input_audio_retention_version') != 1
+            ):
+                raise ValueError('Update the frontend before enabling input audio retirement')
+            retirement = InputAudioRetirement(protocol, call_id, retention_count)
+            log.info('Realtime input audio retention enabled: count=%d', retention_count)
         override = ModelVoice.model_validate((model_info.meta.model_dump().get('voice') if model_info else None) or {})
         voice_model = config.get('audio.realtime.model')
         voice = override.voice or config.get('audio.realtime.voice')
         if not voice_model or not voice or not config.get('audio.realtime.transcription_model'):
             raise ValueError('Configure the Realtime model, voice, and transcription model')
+        audio_input = {
+            'format': {'type': 'audio/pcm', 'rate': 24000},
+            'transcription': {'model': config['audio.realtime.transcription_model']},
+            # Wait for finalized transcription so every function has an input identity.
+            'turn_detection': {
+                'type': 'server_vad',
+                'interrupt_response': False,
+                'create_response': False,
+            },
+            **(config.get('audio.realtime.input_params') or {}),
+        }
+        if retirement and audio_input.get('turn_detection') is not None:
+            if not isinstance(audio_input['turn_detection'], dict):
+                raise ValueError('Invalid Realtime turn detection configuration')
+            # Managed generation must pass the deletion-ack barrier, including
+            # when custom VAD parameters omit or override create_response.
+            audio_input['turn_detection'] = {**audio_input['turn_detection'], 'create_response': False}
         async with asyncio.timeout(30):
             async with asyncio.timeout(15):
                 ws_url, headers = await _get_realtime_connection(config)
@@ -483,19 +516,7 @@ async def realtime_call(ws: WebSocket):
                             + (AVATAR_CALL_INSTRUCTIONS if protocol.animation_tools else '')
                         ),
                         'audio': {
-                            'input': {
-                                'format': {'type': 'audio/pcm', 'rate': 24000},
-                                'transcription': {'model': config['audio.realtime.transcription_model']},
-                                # Wait for the finalized transcript before requesting a response. This gives
-                                # every function call an unambiguous input_item_id, even during barge-in.
-                                'turn_detection': {
-                                    'type': 'server_vad',
-                                    # The client pauses playback until speech is confirmed.
-                                    'interrupt_response': False,
-                                    'create_response': False,
-                                },
-                                **(config.get('audio.realtime.input_params') or {}),
-                            },
+                            'input': audio_input,
                             'output': {'format': {'type': 'audio/pcm', 'rate': 24000}, 'voice': voice},
                         },
                         'tools': [CHAT_TOOL, *protocol.animation_tools],
@@ -506,7 +527,31 @@ async def realtime_call(ws: WebSocket):
             event = await upstream.receive_json()
             if event.get('type') != 'session.updated':
                 raise ValueError('Provider rejected voice configuration. Check model, voice, and transcription model.')
-        await ws.send_json({'type': 'bridge.ready', 'model': voice_model, 'voice': voice, 'sample_rate': 24000})
+        await ws.send_json(
+            {
+                'type': 'bridge.ready',
+                'model': voice_model,
+                'voice': voice,
+                'sample_rate': 24000,
+                'input_audio_retention_count': retention_count,
+            }
+        )
+        writer_lock = asyncio.Lock() if retirement else contextlib.nullcontext()
+
+        async def send_provider(event):
+            async with asyncio.timeout(5):
+                await upstream.send_json(event)
+
+        async def send_client(event):
+            async with asyncio.timeout(5):
+                await ws.send_json(event)
+
+        async def policy_clock():
+            while True:
+                await asyncio.sleep(1)
+                if retirement:
+                    async with writer_lock:
+                        await retirement.pump(send_provider, send_client)
 
         async def client_events():
             while True:
@@ -517,20 +562,29 @@ async def realtime_call(ws: WebSocket):
                 if event == {'type': 'bridge.ping'}:
                     await ws.send_json({'type': 'bridge.pong'})
                     continue
-                try:
-                    command = protocol.command(event)
-                except (ValueError, TypeError):
-                    if not isinstance(event, dict) or event.get('type') != 'conversation.item.truncate':
-                        raise
-                    await ws.send_json(
-                        {'type': 'bridge.error', 'message': 'Invalid audio truncation request', 'fatal': False}
-                    )
-                    continue
-                if event['type'] == 'bridge.result':
-                    protocol.requested.add(f'result:{event["call_id"]}')
-                for item in command if isinstance(command, list) else [command]:
-                    async with asyncio.timeout(5):
-                        await upstream.send_json(item)
+                async with writer_lock:
+                    try:
+                        if not isinstance(event, dict):
+                            raise ValueError('Invalid call command')
+                        command = retirement.command(event) if retirement else protocol.command(event)
+                    except (ValueError, TypeError):
+                        if isinstance(event, dict) and retirement and event.get('type') == 'bridge.context':
+                            await retirement.fail(send_client, 'invalid_text_coverage')
+                            continue
+                        if not isinstance(event, dict) or event.get('type') != 'conversation.item.truncate':
+                            raise
+                        await send_client(
+                            {'type': 'bridge.error', 'message': 'Invalid audio truncation request', 'fatal': False}
+                        )
+                        continue
+                    if event['type'] == 'bridge.result' and not retirement:
+                        protocol.requested.add(f'result:{event["call_id"]}')
+                    if retirement and event['type'] == 'bridge.cancel_pending':
+                        await retirement.cancel_pending(event, send_client)
+                    for item in command if isinstance(command, list) else [command]:
+                        await send_provider(item)
+                    if retirement:
+                        await retirement.pump(send_provider, send_client)
 
         async def provider_events():
             async for message in upstream:
@@ -542,17 +596,22 @@ async def realtime_call(ws: WebSocket):
                 kind = event.get('type', '')
                 if kind == 'error' and event.get('error', {}).get('code') == 'response_cancel_not_active':
                     continue  # Server VAD may finish cancellation before our explicit cancel arrives.
-                if kind == 'error':
-                    # Provider error text can include prompts or credentials.
-                    raise ValueError('Voice provider rejected a request')
-                command = protocol.observe(event)
-                if command:
-                    # Clean up before the client can request another response.
-                    async with asyncio.timeout(5):
-                        await upstream.send_json(command)
+                async with writer_lock:
+                    if kind == 'error':
+                        if retirement and await retirement.provider_error(event, send_client):
+                            continue
+                        # Provider error text can include prompts or credentials.
+                        raise ValueError('Voice provider rejected a request')
+                    command = protocol.observe(event)
+                    if retirement:
+                        retirement.observe(event)
+                    elif command:
+                        await send_provider(command)
+                    if retirement and not kind.endswith('.delta'):
+                        await retirement.pump(send_provider, send_client)
+                # Slow browser playback delivery must not serialize microphone forwarding.
                 if kind.startswith(('response.', 'conversation.item.', 'input_audio_buffer.')):
-                    async with asyncio.timeout(5):
-                        await ws.send_json(event)
+                    await send_client(event)
             raise ValueError('Voice provider connection closed')
 
         async def check_auth():
@@ -568,7 +627,7 @@ async def realtime_call(ws: WebSocket):
                     raise ValueError('Call permission revoked')
             raise ValueError('Call session expired. Start a new call.')
 
-        tasks = [asyncio.create_task(fn()) for fn in (client_events, provider_events, check_auth)]
+        tasks = [asyncio.create_task(fn()) for fn in (client_events, provider_events, check_auth, policy_clock)]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()

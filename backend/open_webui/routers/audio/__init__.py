@@ -60,7 +60,7 @@ from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import strict_match_mime_type
 from open_webui.utils.session_pool import get_session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # pydub needs stdlib audioop (gone in 3.13); keep requires-python capped < 3.13
 if not USE_SLIM:
@@ -101,6 +101,7 @@ TTS_CONFIG_KEYS = {
 
 REALTIME_CONFIG_KEYS = {
     'ENABLED': 'audio.realtime.enabled',
+    'INPUT_AUDIO_RETENTION_COUNT': 'audio.realtime.input_audio_retention_count',
     'PROVIDER': 'audio.realtime.provider',
     'AUTH_TYPE': 'audio.realtime.auth_type',
     'OPENAI_API_BASE_URL': 'audio.realtime.openai.api_base_url',
@@ -296,6 +297,7 @@ class STTConfigForm(BaseModel):
 
 class RealtimeConfigForm(BaseModel):
     ENABLED: bool = False
+    INPUT_AUDIO_RETENTION_COUNT: int = Field(default=0, strict=True, ge=0, le=4096)
     PROVIDER: Literal['openai', 'azure'] = 'openai'
     AUTH_TYPE: Literal['api_key', 'microsoft_entra_id'] = 'api_key'
     OPENAI_API_BASE_URL: str = 'https://api.openai.com/v1'
@@ -305,6 +307,15 @@ class RealtimeConfigForm(BaseModel):
     TRANSCRIPTION_MODEL: str = Field(default='gpt-transcribe', min_length=1, max_length=200)
     INPUT_PARAMS: Optional[dict] = None
     REALTIME_CALL_PROMPT_TEMPLATE: Optional[str] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_legacy_audio_policy(cls, values):
+        # Legacy storage/environment migrate at startup. A stale admin form must
+        # not overwrite a numeric window while saving unrelated audio settings.
+        if isinstance(values, dict) and 'COMPACT_INPUT_AUDIO' in values:
+            raise ValueError('Reload Audio settings and use INPUT_AUDIO_RETENTION_COUNT')
+        return values
 
 
 class AudioConfigUpdateForm(BaseModel):

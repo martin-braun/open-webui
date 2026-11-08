@@ -39,6 +39,7 @@
 	// $i18n.t('OpenAI API Base URL');
 	let realtime: RealtimeConfig & { REALTIME_CALL_PROMPT_TEMPLATE: string } = {
 		ENABLED: false,
+		INPUT_AUDIO_RETENTION_COUNT: 0,
 		PROVIDER: 'openai',
 		AUTH_TYPE: 'api_key',
 		OPENAI_API_BASE_URL: 'https://api.openai.com/v1',
@@ -152,6 +153,14 @@
 	};
 
 	const updateConfigHandler = async () => {
+		if (
+			!Number.isInteger(realtime.INPUT_AUDIO_RETENTION_COUNT) ||
+			realtime.INPUT_AUDIO_RETENTION_COUNT < 0 ||
+			realtime.INPUT_AUDIO_RETENTION_COUNT > 4096
+		) {
+			toast.error($i18n.t('Input audio retirement threshold must be a whole number from 0 to 4096.'));
+			return;
+		}
 		let openaiParams = {};
 		let realtimeInputParams: Record<string, unknown> | null = null;
 		try {
@@ -256,6 +265,7 @@
 			realtime = {
 				...realtime,
 				...res.realtime,
+				INPUT_AUDIO_RETENTION_COUNT: res.realtime?.INPUT_AUDIO_RETENTION_COUNT ?? 0,
 				REALTIME_CALL_PROMPT_TEMPLATE: res.realtime?.REALTIME_CALL_PROMPT_TEMPLATE ?? ''
 			};
 			REALTIME_INPUT_PARAMS = res.realtime?.INPUT_PARAMS
@@ -387,16 +397,45 @@
 						/>
 					</AdminSettingField>
 				</div>
-				<AdminSettingField
-					label={$i18n.t('Input Transcription Model')}
-					forId="realtime-transcription-model"
-				>
-					<input
-						id="realtime-transcription-model"
-						class={inputClass}
-						bind:value={realtime.TRANSCRIPTION_MODEL}
-					/>
-				</AdminSettingField>
+				<div>
+					<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+						<AdminSettingField
+							label={$i18n.t('Input Transcription Model')}
+							forId="realtime-transcription-model"
+						>
+							<input
+								id="realtime-transcription-model"
+								class={inputClass}
+								aria-describedby="realtime-input-audio-help"
+								bind:value={realtime.TRANSCRIPTION_MODEL}
+							/>
+						</AdminSettingField>
+						<AdminSettingField
+							label={$i18n.t('Input Audio Retirement Threshold')}
+							forId="realtime-input-audio-retention-count"
+						>
+							<input
+								id="realtime-input-audio-retention-count"
+								type="number"
+								class={inputClass}
+								aria-describedby="realtime-input-audio-help"
+								min="0"
+								max="4096"
+								step="1"
+								required
+								bind:value={realtime.INPUT_AUDIO_RETENTION_COUNT}
+							/>
+						</AdminSettingField>
+					</div>
+					<p
+						id="realtime-input-audio-help"
+						class="mt-2 text-[0.6875rem] text-gray-400 dark:text-gray-600"
+					>
+						{$i18n.t(
+							'Select the speech-to-text model and the number of input recordings to retain. 0 means unlimited.'
+						)}
+					</p>
+				</div>
 				<AdminSettingField
 					label={$i18n.t('settings.audio.realtime.inputParams')}
 					description={$i18n.t('settings.audio.realtime.inputParamsHelp')}
@@ -447,6 +486,7 @@
 					label={$i18n.t('settings.admin.audio.supportedMimeTypes.label')}
 					description={$i18n.t('settings.admin.audio.supportedMimeTypes.description')}
 					forId="stt-supported-mime-types"
+					className="[&>p]:mt-2"
 				>
 					<input
 						id="stt-supported-mime-types"

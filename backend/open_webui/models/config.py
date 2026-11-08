@@ -319,6 +319,19 @@ class Config(Base):
             default_model_keys: list[str] = []
             now = int(time.time())
 
+            # This runs before seed_defaults: a fresh numeric default must not mask
+            # a persisted opt-in. Existing numeric rows (including zero) always win.
+            legacy_audio = await db.get(Config, 'audio.realtime.compact_input_audio')
+            if legacy_audio is not None:
+                count_key = 'audio.realtime.input_audio_retention_count'
+                count = await db.get(Config, count_key)
+                if count is None:
+                    if type(legacy_audio.value) is not bool:
+                        raise ValueError('Invalid legacy Realtime input audio policy')
+                    db.add(Config(key=count_key, value=int(legacy_audio.value), updated_at=now))
+                await db.delete(legacy_audio)
+                repaired_keys.append(count_key)
+
             for config_key, aliases in DICT_CONFIG_KEY_ALIASES.items():
                 prefixes = (config_key, *aliases)
                 rows = []

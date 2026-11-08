@@ -2410,13 +2410,28 @@
 	) => {
 		const branch = createMessagesList(history, history.currentId);
 		let parentIndex = branch.findIndex((entry) => entry.id === parentId);
+		// With retirement enabled, late ASR still belongs before newer speech in the selected branch.
+		const laterInput =
+			role === 'user' && Number.isInteger(voice.input_order)
+				? branch.findIndex(
+						(entry) =>
+							entry.role === 'user' &&
+							entry.meta?.voice?.call_id === voice.call_id &&
+							entry.meta.voice.input_order > voice.input_order
+					)
+				: -1;
+		if (laterInput >= 0) {
+			parentIndex = laterInput - 1;
+			parentId = branch[laterInput].parentId;
+		}
 		// A chat answer can have been inserted while this spoken reply was being generated.
 		// Keep the reply on that branch, before the next user turn, rather than losing it as a sibling.
 		if (role === 'assistant' && parentIndex >= 0) {
 			while (branch[parentIndex + 1]?.role === 'assistant') parentIndex++;
 			parentId = branch[parentIndex].id;
 		}
-		const nextMessage = parentIndex >= 0 ? branch[parentIndex + 1] : null;
+		const nextMessage =
+			laterInput >= 0 ? branch[laterInput] : parentIndex >= 0 ? branch[parentIndex + 1] : null;
 		const id = uuidv4();
 		const message = {
 			id,
@@ -2435,7 +2450,7 @@
 			history.messages[parentId].childrenIds.push(id);
 			// A second transcript can arrive before the first spoken reply finishes.
 			// Insert that reply before the next user message without switching branches.
-			if (role === 'assistant' && nextMessage?.role === 'user') {
+			if ((role === 'assistant' || laterInput >= 0) && nextMessage?.role === 'user') {
 				nextMessage.parentId = id;
 				message.childrenIds.push(nextMessage.id);
 				history.messages[parentId].childrenIds = history.messages[parentId].childrenIds.filter(
@@ -2443,6 +2458,11 @@
 				);
 				changedMessages[nextMessage.id] = nextMessage;
 			}
+		}
+		if (laterInput === 0 && nextMessage) {
+			nextMessage.parentId = id;
+			message.childrenIds.push(nextMessage.id);
+			changedMessages[nextMessage.id] = nextMessage;
 		}
 		if (history.currentId === parentId) history.currentId = id;
 		history = history;
@@ -2518,7 +2538,7 @@
 							if (speech)
 								content += `\n[Historical voice transcript, not current task status]\n${speech}`;
 						}
-						return { role: message.role, content };
+						return { role: message.role, content, messageId: message.id, voice };
 					})
 				};
 			},

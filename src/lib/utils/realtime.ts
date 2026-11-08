@@ -15,7 +15,12 @@ type CallContext = {
 	terminalId?: string;
 	voiceModel?: string;
 	voice?: string;
-	messages: { role: string; content: string }[];
+	messages: {
+		role: string;
+		content: string;
+		messageId?: string;
+		voice?: { call_id?: string; input_item_id?: string };
+	}[];
 };
 type VoiceTurn = {
 	callId: string;
@@ -102,10 +107,20 @@ export class RealtimeCall {
 	private lastPong = 0;
 	private activeResponse = '';
 	private responseRequested = false;
+	private inputAudioRetentionCount = 0;
+	private get compactInputAudio() {
+		return this.inputAudioRetentionCount > 0;
+	}
+	private inputAudioBlocked = false;
+	private dispatchId = '';
+	private selectedInputOrder = -1;
 	private speakingResponses = new Set<string>();
 	private interrupted = new Set<string>();
 	private responses = new Map<string, any>();
-	private inputs = new Map<string, { text: string; userId: Promise<string>; modelId: string }>();
+	private inputs = new Map<
+		string,
+		{ text: string; userId: Promise<string>; modelId: string; savedId?: string }
+	>();
 	private calls = new Map<string, VoiceTurn>();
 	private pending?: VoiceTurn;
 	private commands: any[] = [];
@@ -169,6 +184,8 @@ export class RealtimeCall {
 				this.send({
 					type: 'auth',
 					token,
+					call_id: this.callId,
+					input_audio_retention_version: 1,
 					chat_id: context.chatId,
 					model_id: context.modelId,
 					terminal_id: context.terminalId
@@ -267,6 +284,7 @@ export class RealtimeCall {
 	}
 
 	private enqueue(command: any) {
+		if (this.inputAudioBlocked) return;
 		if (
 			command.type === 'bridge.status' &&
 			this.commands.some((item) => item.type === 'bridge.status' && item.status === command.status)
@@ -282,6 +300,7 @@ export class RealtimeCall {
 	private flush() {
 		if (
 			!this.connected ||
+			this.inputAudioBlocked ||
 			this.receivingSpeech ||
 			this.savingHistory ||
 			this.activeResponse ||
@@ -296,7 +315,10 @@ export class RealtimeCall {
 		if (command) {
 			this.syncContext();
 			this.responseRequested = true;
-			this.send(command);
+			if (this.compactInputAudio) {
+				this.dispatchId = uuidv4();
+				this.send({ ...command, request_id: this.dispatchId });
+			} else this.send(command);
 		}
 	}
 
@@ -327,7 +349,7 @@ export class RealtimeCall {
 		if (!this.connected) return;
 		// Replace the bounded snapshot, so streaming answers and task status cannot go stale.
 		let budget = 64000;
-		const messages = this.options
+		const selected = this.options
 			.context()
 			.messages.slice(-100)
 			.reverse()
@@ -335,20 +357,72 @@ export class RealtimeCall {
 				if (!['user', 'assistant'].includes(message.role) || budget <= 0) return [];
 				const content = message.content.slice(0, Math.min(32000, budget));
 				budget -= content.length;
-				return content ? [{ role: message.role, content }] : [];
+				return content ? [{ ...message, content }] : [];
 			})
 			.reverse();
-		const snapshot = JSON.stringify(messages);
+		const messages = selected.map(({ role, content }) => ({ role, content }));
+		const coverage = selected.flatMap((message, index) => {
+			const itemId = message.voice?.input_item_id;
+			const input = itemId ? this.inputs.get(itemId) : undefined;
+			// Persistence completion, call identity and full selected text are all required.
+			// Matching text alone cannot distinguish two separate utterances of "yes".
+			return this.compactInputAudio &&
+				message.role === 'user' &&
+				message.voice?.call_id === this.callId &&
+				input?.savedId &&
+				input.savedId === message.messageId &&
+				message.content === input.text
+				? [{ item_id: itemId, message_id: input.savedId, index }]
+				: [];
+		});
+		const snapshot = JSON.stringify(this.compactInputAudio ? { messages, coverage } : messages);
 		if (snapshot === this.chatContext) return;
 		this.chatContext = snapshot;
-		this.send({ type: 'bridge.context', messages });
+		this.send({
+			type: 'bridge.context',
+			messages,
+			...(this.compactInputAudio ? { call_id: this.callId, coverage } : {})
+		});
+	}
+
+	private settleResponse(response: any) {
+		if (!this.compactInputAudio || !response?.done) return;
+		const session = this.session;
+		// Provider completion is not chat persistence, nor the end of an animation/tool turn.
+		void this.metadata.then(() => {
+			if (session !== this.session || !this.connected) return;
+			this.syncContext();
+			this.send({
+				type: 'bridge.response.settled',
+				response_id: response.id,
+				continuation: this.commands.some(
+					(command) => command.type === 'bridge.animation.respond' && command.response_id === response.id
+				)
+			});
+		});
 	}
 
 	private event(event: any) {
 		const type = event.type;
 		if (type === 'bridge.error') {
+			if (event.code === 'input_audio_sync' && this.compactInputAudio) {
+				this.inputAudioBlocked = true;
+				this.responseRequested = this.cancelRequested = false;
+				this.dispatchId = '';
+				this.commands = [];
+				this.options.change();
+			}
 			if (event.fatal === false) this.options.error(event.message);
 			else this.fail(event.message);
+			return;
+		}
+		if (type === 'bridge.dispatch.cancelled') {
+			if (event.request_id === this.dispatchId) {
+				this.responseRequested = this.cancelRequested = false;
+				this.dispatchId = '';
+				this.flush();
+				this.options.change();
+			}
 			return;
 		}
 		if (type === 'bridge.pong') {
@@ -359,6 +433,13 @@ export class RealtimeCall {
 			if (event.sample_rate !== 24000) throw new Error('Wrong sample rate');
 			this.model = event.model;
 			this.voice = event.voice;
+			if (
+				!Number.isInteger(event.input_audio_retention_count) ||
+				event.input_audio_retention_count < 0 ||
+				event.input_audio_retention_count > 4096
+			)
+				throw new Error('Invalid input audio retention count. Update the server and frontend.');
+			this.inputAudioRetentionCount = event.input_audio_retention_count;
 			this.connected = true;
 			this.connecting = false;
 			this.syncContext();
@@ -383,7 +464,14 @@ export class RealtimeCall {
 			if (this.inputs.has(event.item_id)) return;
 			const failed = type === 'conversation.item.input_audio_transcription.failed';
 			const text = failed ? '' : event.transcript?.trim();
-			if (text) this.stopSpeaking();
+			const inputOrder = event.bridge_input_order;
+			if (text && this.compactInputAudio && !Number.isInteger(inputOrder))
+				throw new Error('Missing input order');
+			const newest = !this.compactInputAudio || inputOrder > this.selectedInputOrder;
+			if (text && newest) {
+				if (this.compactInputAudio) this.selectedInputOrder = inputOrder;
+				this.stopSpeaking();
+			}
 			if (!this.receivingSpeech) this.audio?.port.postMessage({ type: 'pause', paused: false });
 			if (!text) {
 				// Empty VAD segments are not requests and must not produce assistant replies.
@@ -401,6 +489,7 @@ export class RealtimeCall {
 				return this.options.addMessage('user', text, {
 					call_id: this.callId,
 					input_item_id: event.item_id,
+					...(this.compactInputAudio ? { input_order: inputOrder } : {}),
 					model: this.model
 				});
 			});
@@ -408,13 +497,19 @@ export class RealtimeCall {
 			this.inputs.set(event.item_id, { text, userId, modelId });
 			userId
 				.finally(() => this.savingHistory--)
-				.then(() => {
-					if (session === this.session)
-						this.enqueue({ type: 'bridge.respond', item_id: event.item_id });
+				.then((id) => {
+					if (session === this.session) {
+						const input = this.inputs.get(event.item_id);
+						if (input) input.savedId = id;
+						if (this.compactInputAudio) this.syncContext();
+						if (!this.compactInputAudio || inputOrder === this.selectedInputOrder)
+							this.enqueue({ type: 'bridge.respond', item_id: event.item_id });
+					}
 				})
 				.catch(() => this.fail('Could not save the spoken message.'));
 		} else if (type === 'response.created') {
 			this.responseRequested = false;
+			this.dispatchId = '';
 			this.activeResponse = event.response.id;
 			if (this.cancelRequested) {
 				this.cancelRequested = false;
@@ -508,6 +603,7 @@ export class RealtimeCall {
 					type: 'bridge.result',
 					call_id: event.item.call_id,
 					status: 'cancelled',
+					...(this.compactInputAudio ? { speak: false } : {}),
 					answer: 'This input has already been delegated.'
 				});
 				return;
@@ -583,6 +679,7 @@ export class RealtimeCall {
 				) {
 					this.enqueue({ type: 'bridge.animation.respond', response_id: response.id });
 				}
+				this.settleResponse(response);
 			}
 			if (['failed', 'incomplete'].includes(event.response.status))
 				this.options.error('The voice response did not complete.');
@@ -619,6 +716,7 @@ export class RealtimeCall {
 			type: 'bridge.result',
 			call_id: turn.callId,
 			status,
+			...(this.compactInputAudio ? { speak } : {}),
 			answer:
 				answer.length <= 100000
 					? answer
@@ -676,6 +774,7 @@ export class RealtimeCall {
 			.catch(() => this.options.error('Could not save the voice transcript.'))
 			.finally(() => {
 				this.savingHistory--;
+				if (this.compactInputAudio) this.syncContext();
 				this.flush();
 			});
 	}
@@ -683,6 +782,8 @@ export class RealtimeCall {
 	stopSpeaking() {
 		this.animationInterruption++;
 		if (this.responseRequested) this.cancelRequested = true;
+		if (this.compactInputAudio && this.responseRequested && this.dispatchId)
+			this.send({ type: 'bridge.cancel_pending', request_id: this.dispatchId });
 		const responses = new Set(
 			[...this.speakingResponses].filter((id) => !this.interrupted.has(id))
 		);
@@ -705,6 +806,8 @@ export class RealtimeCall {
 		this.commands = this.commands.filter(
 			(command) => command.type !== 'bridge.status' && command.type !== 'bridge.animation.respond'
 		);
+		if (this.compactInputAudio)
+			for (const response of this.responses.values()) this.settleResponse(response);
 		this.options.change();
 	}
 
@@ -780,6 +883,10 @@ export class RealtimeCall {
 		this.inputLevel = this.outputLevel = 0;
 		this.playbackActive = false;
 		this.responseRequested = false;
+		this.inputAudioRetentionCount = 0;
+		this.inputAudioBlocked = false;
+		this.dispatchId = '';
+		this.selectedInputOrder = -1;
 		this.cancelRequested = false;
 		this.receivingSpeech = '';
 		this.userSpeaking = false;

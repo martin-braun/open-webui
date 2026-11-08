@@ -1648,6 +1648,19 @@ AUDIO_TTS_VOICE = os.getenv('AUDIO_TTS_VOICE', 'alloy')
 REALTIME_TTS_PROMPT_TEMPLATE = os.getenv('REALTIME_TTS_PROMPT_TEMPLATE')
 
 AUDIO_REALTIME_ENABLED = os.getenv('AUDIO_REALTIME_ENABLED', 'False').lower() == 'true'
+_input_audio_retention_count = os.getenv('AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT')
+if _input_audio_retention_count is None:
+    # The old environment flag is only a fallback, never a second policy.
+    AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT = int(
+        os.getenv('AUDIO_REALTIME_COMPACT_INPUT_AUDIO', 'False').lower() == 'true'
+    )
+else:
+    try:
+        AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT = int(_input_audio_retention_count)
+    except ValueError:
+        raise ValueError('AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT must be an integer from 0 to 4096') from None
+    if not 0 <= AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT <= 4096:
+        raise ValueError('AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT must be an integer from 0 to 4096')
 AUDIO_REALTIME_PROVIDER = os.getenv('AUDIO_REALTIME_PROVIDER', 'openai')
 AUDIO_REALTIME_AUTH_TYPE = os.getenv('AUDIO_REALTIME_AUTH_TYPE', 'api_key')
 AUDIO_REALTIME_OPENAI_API_BASE_URL = os.getenv('AUDIO_REALTIME_OPENAI_API_BASE_URL', 'https://api.openai.com/v1')
@@ -3222,6 +3235,7 @@ DEFAULT_CONFIG = {
     'audio.tts.openai.params': AUDIO_TTS_OPENAI_PARAMS,
     'audio.tts.api_key': AUDIO_TTS_API_KEY,
     'audio.realtime.enabled': AUDIO_REALTIME_ENABLED,
+    'audio.realtime.input_audio_retention_count': AUDIO_REALTIME_INPUT_AUDIO_RETENTION_COUNT,
     'audio.realtime.provider': AUDIO_REALTIME_PROVIDER,
     'audio.realtime.auth_type': AUDIO_REALTIME_AUTH_TYPE,
     'audio.realtime.openai.api_base_url': AUDIO_REALTIME_OPENAI_API_BASE_URL,
